@@ -1016,7 +1016,7 @@ static void __setup_root(struct btrfs_root *root, struct btrfs_fs_info *fs_info,
 	root->orphan_cleanup_state = 0;
 
 	root->last_trans = 0;
-	root->highest_objectid = 0;
+	root->free_objectid = 0;
 	root->nr_delalloc_inodes = 0;
 	root->nr_ordered_extents = 0;
 	root->inode_tree = RB_ROOT;
@@ -1367,14 +1367,13 @@ static int btrfs_init_fs_root(struct btrfs_root *root, dev_t anon_dev)
 	}
 
 	mutex_lock(&root->objectid_mutex);
-	ret = btrfs_find_highest_objectid(root,
-					&root->highest_objectid);
+	ret = btrfs_init_root_free_objectid(root);
 	if (ret) {
 		mutex_unlock(&root->objectid_mutex);
 		goto fail;
 	}
 
-	ASSERT(root->highest_objectid <= BTRFS_LAST_FREE_OBJECTID);
+	ASSERT(root->free_objectid <= BTRFS_LAST_FREE_OBJECTID);
 
 	mutex_unlock(&root->objectid_mutex);
 
@@ -1457,7 +1456,7 @@ void btrfs_check_leaked_roots(struct btrfs_fs_info *fs_info)
 		root = list_first_entry(&fs_info->allocated_roots,
 					struct btrfs_root, leak_list);
 		btrfs_err(fs_info, "leaked root %s refcount %d",
-			  btrfs_root_name(root->root_key.objectid, buf),
+			  btrfs_root_name(&root->root_key, buf),
 			  refcount_read(&root->refs));
 		while (refcount_read(&root->refs) > 1)
 			btrfs_put_root(root);
@@ -1729,7 +1728,7 @@ static int cleaner_kthread(void *arg)
 		 */
 		btrfs_delete_unused_bgs(fs_info);
 sleep:
-		clear_bit(BTRFS_FS_CLEANER_RUNNING, &fs_info->flags);
+		clear_and_wake_up_bit(BTRFS_FS_CLEANER_RUNNING, &fs_info->flags);
 		if (kthread_should_park())
 			kthread_parkme();
 		if (kthread_should_stop())
@@ -2646,14 +2645,13 @@ static int __cold init_tree_roots(struct btrfs_fs_info *fs_info)
 		 * No need to hold btrfs_root::objectid_mutex since the fs
 		 * hasn't been fully initialised and we are the only user
 		 */
-		ret = btrfs_find_highest_objectid(tree_root,
-						&tree_root->highest_objectid);
+		ret = btrfs_init_root_free_objectid(tree_root);
 		if (ret < 0) {
 			handle_error = true;
 			continue;
 		}
 
-		ASSERT(tree_root->highest_objectid <= BTRFS_LAST_FREE_OBJECTID);
+		ASSERT(tree_root->free_objectid <= BTRFS_LAST_FREE_OBJECTID);
 
 		ret = btrfs_read_roots(fs_info);
 		if (ret < 0) {
@@ -2830,6 +2828,9 @@ static int init_mount_fs_info(struct btrfs_fs_info *fs_info, struct super_block 
 		return -ENOMEM;
 	btrfs_init_delayed_root(fs_info->delayed_root);
 
+	if (sb_rdonly(sb))
+		set_bit(BTRFS_FS_STATE_RO, &fs_info->fs_state);
+
 	return btrfs_alloc_stripe_hash_table(fs_info);
 }
 
@@ -2969,6 +2970,7 @@ int btrfs_start_pre_rw_mount(struct btrfs_fs_info *fs_info)
 		}
 	}
 
+	ret = btrfs_find_orphan_roots(fs_info);
 out:
 	return ret;
 }
@@ -3382,10 +3384,6 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 			goto fail_qgroup;
 		}
 	}
-
-	ret = btrfs_find_orphan_roots(fs_info);
-	if (ret)
-		goto fail_qgroup;
 
 	fs_info->fs_root = btrfs_get_fs_root(fs_info, BTRFS_FS_TREE_OBJECTID, true);
 	if (IS_ERR(fs_info->fs_root)) {
@@ -4181,6 +4179,9 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 	invalidate_inode_pages2(fs_info->btree_inode->i_mapping);
 	btrfs_stop_all_workers(fs_info);
 
+	/* We shouldn't have any transaction open at this point */
+	ASSERT(list_empty(&fs_info->trans_list));
+
 	clear_bit(BTRFS_FS_OPEN, &fs_info->flags);
 	free_root_pointers(fs_info, true);
 	btrfs_free_fs_roots(fs_info);
@@ -4742,7 +4743,7 @@ static int btrfs_cleanup_transaction(struct btrfs_fs_info *fs_info)
 	return 0;
 }
 
-int btrfs_find_highest_objectid(struct btrfs_root *root, u64 *objectid)
+int btrfs_init_root_free_objectid(struct btrfs_root *root)
 {
 	struct btrfs_path *path;
 	int ret;
@@ -4766,10 +4767,10 @@ int btrfs_find_highest_objectid(struct btrfs_root *root, u64 *objectid)
 		slot = path->slots[0] - 1;
 		l = path->nodes[0];
 		btrfs_item_key_to_cpu(l, &found_key, slot);
-		*objectid = max_t(u64, found_key.objectid,
-				  BTRFS_FIRST_FREE_OBJECTID - 1);
+		root->free_objectid = max_t(u64, found_key.objectid + 1,
+					    BTRFS_FIRST_FREE_OBJECTID);
 	} else {
-		*objectid = BTRFS_FIRST_FREE_OBJECTID - 1;
+		root->free_objectid = BTRFS_FIRST_FREE_OBJECTID;
 	}
 	ret = 0;
 error:
@@ -4777,12 +4778,12 @@ error:
 	return ret;
 }
 
-int btrfs_find_free_objectid(struct btrfs_root *root, u64 *objectid)
+int btrfs_get_free_objectid(struct btrfs_root *root, u64 *objectid)
 {
 	int ret;
 	mutex_lock(&root->objectid_mutex);
 
-	if (unlikely(root->highest_objectid >= BTRFS_LAST_FREE_OBJECTID)) {
+	if (unlikely(root->free_objectid >= BTRFS_LAST_FREE_OBJECTID)) {
 		btrfs_warn(root->fs_info,
 			   "the objectid of root %llu reaches its highest value",
 			   root->root_key.objectid);
@@ -4790,7 +4791,7 @@ int btrfs_find_free_objectid(struct btrfs_root *root, u64 *objectid)
 		goto out;
 	}
 
-	*objectid = ++root->highest_objectid;
+	*objectid = root->free_objectid++;
 	ret = 0;
 out:
 	mutex_unlock(&root->objectid_mutex);
