@@ -6299,12 +6299,18 @@ static int changed_inode(struct send_ctx *sctx,
 		right_gen = btrfs_inode_generation(sctx->right_path->nodes[0],
 				right_ii);
 
+		u64 left_type = S_IFMT & btrfs_inode_mode(
+				sctx->left_path->nodes[0], left_ii);
+		u64 right_type = S_IFMT & btrfs_inode_mode(
+				sctx->right_path->nodes[0], right_ii);
+
+
 		/*
 		 * The cur_ino = root dir case is special here. We can't treat
 		 * the inode as deleted+reused because it would generate a
 		 * stream that tries to delete/mkdir the root dir.
 		 */
-		if (left_gen != right_gen &&
+		if ((left_gen != right_gen || left_type != right_type) &&
 		    sctx->cur_ino != BTRFS_FIRST_FREE_OBJECTID)
 			sctx->cur_inode_recreated = 1;
 	}
@@ -6359,10 +6365,10 @@ static int changed_inode(struct send_ctx *sctx,
 	} else if (result == BTRFS_COMPARE_TREE_CHANGED) {
 		/*
 		 * We need to do some special handling in case the inode was
-		 * reported as changed with a changed generation number. This
-		 * means that the original inode was deleted and new inode
-		 * reused the same inum. So we have to treat the old inode as
-		 * deleted and the new one as new.
+		 * reported as changed with a changed generation number or
+		 * changed inode type. This means that the original inode was
+		 * deleted and new inode reused the same inum. So we have to
+		 * treat the old inode as deleted and the new one as new.
 		 */
 		if (sctx->cur_inode_recreated) {
 			/*
