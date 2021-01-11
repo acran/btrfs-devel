@@ -102,7 +102,7 @@ struct send_ctx {
 	u64 cur_ino;
 	u64 cur_inode_gen;
 	int cur_inode_new;
-	int cur_inode_new_gen;
+	int cur_inode_recreated;
 	int cur_inode_deleted;
 	u64 cur_inode_size;
 	u64 cur_inode_mode;
@@ -322,7 +322,7 @@ static int is_waiting_for_rm(struct send_ctx *sctx, u64 dir_ino, u64 gen);
 static int need_send_hole(struct send_ctx *sctx)
 {
 	return (sctx->parent_root && !sctx->cur_inode_new &&
-		!sctx->cur_inode_new_gen && !sctx->cur_inode_deleted &&
+		!sctx->cur_inode_recreated && !sctx->cur_inode_deleted &&
 		S_ISREG(sctx->cur_inode_mode));
 }
 
@@ -6265,7 +6265,7 @@ static int changed_inode(struct send_ctx *sctx,
 	u64 right_gen = 0;
 
 	sctx->cur_ino = key->objectid;
-	sctx->cur_inode_new_gen = 0;
+	sctx->cur_inode_recreated = 0;
 	sctx->cur_inode_last_extent = (u64)-1;
 	sctx->cur_inode_next_write_offset = 0;
 	sctx->ignore_cur_inode = false;
@@ -6306,7 +6306,7 @@ static int changed_inode(struct send_ctx *sctx,
 		 */
 		if (left_gen != right_gen &&
 		    sctx->cur_ino != BTRFS_FIRST_FREE_OBJECTID)
-			sctx->cur_inode_new_gen = 1;
+			sctx->cur_inode_recreated = 1;
 	}
 
 	/*
@@ -6364,7 +6364,7 @@ static int changed_inode(struct send_ctx *sctx,
 		 * reused the same inum. So we have to treat the old inode as
 		 * deleted and the new one as new.
 		 */
-		if (sctx->cur_inode_new_gen) {
+		if (sctx->cur_inode_recreated) {
 			/*
 			 * First, process the inode as if it was deleted.
 			 */
@@ -6401,7 +6401,8 @@ static int changed_inode(struct send_ctx *sctx,
 				goto out;
 			/*
 			 * Advance send_progress now as we did not get into
-			 * process_recorded_refs_if_needed in the new_gen case.
+			 * process_recorded_refs_if_needed in the
+			 * cur_inode_recreated case.
 			 */
 			sctx->send_progress = sctx->cur_ino + 1;
 
@@ -6418,7 +6419,7 @@ static int changed_inode(struct send_ctx *sctx,
 		} else {
 			sctx->cur_inode_gen = left_gen;
 			sctx->cur_inode_new = 0;
-			sctx->cur_inode_new_gen = 0;
+			sctx->cur_inode_recreated = 0;
 			sctx->cur_inode_deleted = 0;
 			sctx->cur_inode_size = btrfs_inode_size(
 					sctx->left_path->nodes[0], left_ii);
@@ -6435,7 +6436,7 @@ out:
  * We have to process new refs before deleted refs, but compare_trees gives us
  * the new and deleted refs mixed. To fix this, we record the new/deleted refs
  * first and later process them in process_recorded_refs.
- * For the cur_inode_new_gen case, we skip recording completely because
+ * For the cur_inode_recreated case, we skip recording completely because
  * changed_inode did already initiate processing of refs. The reason for this is
  * that in this case, compare_tree actually compares the refs of 2 different
  * inodes. To fix this, process_all_refs is used in changed_inode to handle all
@@ -6451,7 +6452,7 @@ static int changed_ref(struct send_ctx *sctx,
 		return -EIO;
 	}
 
-	if (!sctx->cur_inode_new_gen &&
+	if (!sctx->cur_inode_recreated &&
 	    sctx->cur_ino != BTRFS_FIRST_FREE_OBJECTID) {
 		if (result == BTRFS_COMPARE_TREE_NEW)
 			ret = record_new_ref(sctx);
@@ -6466,8 +6467,8 @@ static int changed_ref(struct send_ctx *sctx,
 
 /*
  * Process new/deleted/changed xattrs. We skip processing in the
- * cur_inode_new_gen case because changed_inode did already initiate processing
- * of xattrs. The reason is the same as in changed_ref
+ * cur_inode_recreated case because changed_inode did already initiate
+ * processing of xattrs. The reason is the same as in changed_ref
  */
 static int changed_xattr(struct send_ctx *sctx,
 			 enum btrfs_compare_tree_result result)
@@ -6479,7 +6480,7 @@ static int changed_xattr(struct send_ctx *sctx,
 		return -EIO;
 	}
 
-	if (!sctx->cur_inode_new_gen && !sctx->cur_inode_deleted) {
+	if (!sctx->cur_inode_recreated && !sctx->cur_inode_deleted) {
 		if (result == BTRFS_COMPARE_TREE_NEW)
 			ret = process_new_xattr(sctx);
 		else if (result == BTRFS_COMPARE_TREE_DELETED)
@@ -6493,8 +6494,8 @@ static int changed_xattr(struct send_ctx *sctx,
 
 /*
  * Process new/deleted/changed extents. We skip processing in the
- * cur_inode_new_gen case because changed_inode did already initiate processing
- * of extents. The reason is the same as in changed_ref
+ * cur_inode_recreated case because changed_inode did already initiate
+ * processing of extents. The reason is the same as in changed_ref
  */
 static int changed_extent(struct send_ctx *sctx,
 			  enum btrfs_compare_tree_result result)
@@ -6517,7 +6518,7 @@ static int changed_extent(struct send_ctx *sctx,
 	if (sctx->cur_ino != sctx->cmp_key->objectid)
 		return 0;
 
-	if (!sctx->cur_inode_new_gen && !sctx->cur_inode_deleted) {
+	if (!sctx->cur_inode_recreated && !sctx->cur_inode_deleted) {
 		if (result != BTRFS_COMPARE_TREE_DELETED)
 			ret = process_extent(sctx, sctx->left_path,
 					sctx->cmp_key);
